@@ -249,7 +249,7 @@ static long WalSndComputeSleeptime(TimestampTz now);
 static void WalSndWait(uint32 socket_events, long timeout, uint32 wait_event);
 static void WalSndPrepareWrite(LogicalDecodingContext *ctx, XLogRecPtr lsn, TransactionId xid, bool last_write);
 static void WalSndWriteData(LogicalDecodingContext *ctx, XLogRecPtr lsn, TransactionId xid, bool last_write);
-static void WalSndUpdateProgress(LogicalDecodingContext *ctx, XLogRecPtr lsn, TransactionId xid);
+static void WalSndUpdateProgress(LogicalDecodingContext *ctx, XLogRecPtr lsn, TransactionId xid, bool send_keep_alive);
 static XLogRecPtr WalSndWaitForWal(XLogRecPtr loc);
 static void LagTrackerWrite(XLogRecPtr lsn, TimestampTz local_flush_time);
 static TimeOffset LagTrackerRead(int head, XLogRecPtr lsn, TimestampTz now);
@@ -1446,25 +1446,54 @@ WalSndWriteData(LogicalDecodingContext *ctx, XLogRecPtr lsn, TransactionId xid,
 /*
  * LogicalDecodingContext 'update_progress' callback.
  *
- * Write the current position to the lag tracker (see XLogSendPhysical).
+ * Try to send a keepalive message to standby.
+ * And write the current position to the lag tracker (see XLogSendPhysical).
  */
 static void
-WalSndUpdateProgress(LogicalDecodingContext *ctx, XLogRecPtr lsn, TransactionId xid)
+WalSndUpdateProgress(LogicalDecodingContext *ctx, XLogRecPtr lsn, TransactionId xid, bool send_keep_alive)
 {
-	static TimestampTz sendTime = 0;
+	static TimestampTz trackTime = 0;
 	TimestampTz now = GetCurrentTimestamp();
+
+	if (send_keep_alive)
+	{
+		/*
+		 * If the standby does not receive any message from the primary for
+		 * more than (wal_receiver_timeout / 2), the standby will send a
+		 * message requesting a reply to the primary. If receive this message,
+		 * reply immediately to avoid timeout.
+		 */
+
+		if (now < TimestampTzPlusMilliseconds(last_reply_timestamp,
+											wal_sender_timeout / 2) &&
+			!pq_is_send_pending())
+			return;
+
+		/* Check for input from the client. */
+		ProcessRepliesIfAny();
+
+		/* die if timeout was reached */
+		WalSndCheckTimeOut();
+
+		/* Send keepalive if the time has come */
+		WalSndKeepaliveIfNecessary();
+
+		/* Try to flush pending output to the client */
+		if (pq_flush_if_writable() != 0)
+			WalSndShutdown();
+	}
 
 	/*
 	 * Track lag no more than once per WALSND_LOGICAL_LAG_TRACK_INTERVAL_MS to
 	 * avoid flooding the lag tracker when we commit frequently.
 	 */
 #define WALSND_LOGICAL_LAG_TRACK_INTERVAL_MS	1000
-	if (!TimestampDifferenceExceeds(sendTime, now,
+	if (!TimestampDifferenceExceeds(trackTime, now,
 									WALSND_LOGICAL_LAG_TRACK_INTERVAL_MS))
 		return;
 
 	LagTrackerWrite(lsn, now);
-	sendTime = now;
+	trackTime = now;
 }
 
 /*

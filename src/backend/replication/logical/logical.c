@@ -680,15 +680,15 @@ OutputPluginWrite(struct LogicalDecodingContext *ctx, bool last_write)
 }
 
 /*
- * Update progress tracking (if supported).
+ * Update progress tracking and try to send a keepalive message (if supported).
  */
 void
-OutputPluginUpdateProgress(struct LogicalDecodingContext *ctx)
+OutputPluginUpdateProgress(struct LogicalDecodingContext *ctx, bool send_keep_alive)
 {
 	if (!ctx->update_progress)
 		return;
 
-	ctx->update_progress(ctx, ctx->write_location, ctx->write_xid);
+	ctx->update_progress(ctx, ctx->write_location, ctx->write_xid, send_keep_alive);
 }
 
 /*
@@ -1929,4 +1929,43 @@ UpdateDecodingStats(LogicalDecodingContext *ctx)
 	rb->streamBytes = 0;
 	rb->totalTxns = 0;
 	rb->totalBytes = 0;
+}
+
+/*
+ * Try to send a keepalive message if too many changes were skipped.
+ *
+ * When we loop through changes in a transaction(see ReorderBufferProcessTXN),
+ * if no message is sent to standby for a long time during a large transaction,
+ * we should send a keepalive message to ensure that the standby will not
+ * timeout.
+ */
+void
+UpdateProgress(LogicalDecodingContext *ctx, bool skipped)
+{
+	static int skipped_changes_count = 0;
+
+	/*
+	 * skipped_changes_count is reset when processing changes that do not
+	 * need to be skipped.
+	 */
+	if (!skipped)
+	{
+		skipped_changes_count = 0;
+		return;
+	}
+
+	/*
+	 * After continuously skipping SKIPPED_CHANGES_THRESHOLD changes, try to send a
+	 * keepalive message.
+	 */
+	#define SKIPPED_CHANGES_THRESHOLD 100
+
+	if (++skipped_changes_count >= SKIPPED_CHANGES_THRESHOLD)
+	{
+		/* Try to send a keepalive message. */
+		OutputPluginUpdateProgress(ctx, true);
+
+		/* After trying to send a keepalive message, reset the flag. */
+		skipped_changes_count = 0;
+	}
 }
